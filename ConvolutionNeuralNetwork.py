@@ -1,123 +1,129 @@
 import os
 import wfdb
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
 from sklearn.utils import class_weight
 import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers
 
-# --- 1. SETTINGS & PATHS ---
-DATA_PATH = "/content/drive/MyDrive/Colab Notebooks/mitdb/"
-SAMPLING_RATE = 360
+# =========================
+# CONFIG
+# =========================
+DATA_PATH = "/content/drive/MyDrive/Colab Notebooks/mitdb"
+WINDOW_BEFORE = 93
+WINDOW_AFTER = 93
 WINDOW_SIZE = 187
-HALF_WINDOW = 93
-SEED = 42
+FS = 360
 
-# Records to exclude (Paced beats)
-excluded_records = ['102', '104']
+EXCLUDED_RECORDS = ['102', '104']
+REVERSED_RECORD = '114'
 
-# --- 2. DATA UTILITIES ---
-def get_record_list(path):
-    files = [f for f in os.listdir(path) if f.endswith('.dat')]
-    records = [r.replace('.dat', '') for r in files if r.replace('.dat', '') not in excluded_records]
-    return sorted(records)
+NORMAL_SYMBOLS = ['N', '·']
+ARRHYTHMIA_SYMBOLS = ['L','R','A','a','J','S','V','F','e','j','E','Q','|','x']
+VALID_SYMBOLS = set(NORMAL_SYMBOLS + ARRHYTHMIA_SYMBOLS)
 
-def extract_beats_from_record(rid):
-    """
-    Extracts beats, applies Z-score normalization, and handles Record 114 logic.
-    """
-    X_rec, y_rec = [], []
-    record_path = os.path.join(DATA_PATH, rid)
+# =========================
+# LOAD SAME PATIENT SPLIT
+# =========================
+train_patients = np.load("train_patients.npy")
+val_patients   = np.load("val_patients.npy")
+test_patients  = np.load("test_patients.npy")
 
-    # IEEE Rationale: Use Lead II (Ch 0) generally, Lead V1 (Ch 1) for Record 114
-    channel = 1 if rid == '114' else 0
+print("Using SAME patient split as RF/SVM")
 
-    try:
-        record = wfdb.rdrecord(record_path, channels=[channel])
-        annotation = wfdb.rdann(record_path, 'atr')
-        signal = record.p_signal.flatten()
+# =========================
+# LOAD RAW BEATS (IMPORTANT)
+# =========================
+def load_beats_by_patients(patient_list):
+    beats, labels = [], []
 
-        # Z-score Normalization (Zero mean, unit variance)
-        signal = (signal - np.mean(signal)) / np.std(signal)
+    for rec in patient_list:
+        sig, _ = wfdb.rdsamp(os.path.join(DATA_PATH, rec))
+        ann = wfdb.rdann(os.path.join(DATA_PATH, rec), 'atr')
 
-        for i, ann_idx in enumerate(annotation.sample):
-            symbol = annotation.symbol[i]
+        ch = 1 if rec == REVERSED_RECORD else 0
+        signal = sig[:, ch]
 
-            # Label Mapping: Normal (0), Arrhythmia (1)
-            if symbol in ['N', '.']:
-                label = 0
-            elif symbol in ['L', 'R', 'A', 'a', 'J', 'S', 'V', 'E', 'F', 'e', 'j']:
-                label = 1
+        for s, sym in zip(ann.sample, ann.symbol):
+            if sym not in VALID_SYMBOLS:
+                continue
+
+            y = 0 if sym in NORMAL_SYMBOLS else 1
+
+            start = s - WINDOW_BEFORE
+            end = s + WINDOW_AFTER + 1
+
+            beat = np.zeros(187)
+
+            if start < 0:
+                beat[-start:] = signal[0:end]
+            elif end > len(signal):
+                beat[:len(signal)-start] = signal[start:]
             else:
-                continue # Skip non-beat symbols like '+' or '~'
+                beat = signal[start:end]
 
-            # Window extraction with boundary handling
-            if ann_idx - HALF_WINDOW >= 0 and ann_idx + HALF_WINDOW + 1 <= len(signal):
-                beat = signal[ann_idx - HALF_WINDOW : ann_idx + HALF_WINDOW + 1]
-                X_rec.append(beat)
-                y_rec.append(label)
+            # SAME normalization as before
+            if np.std(beat) > 0:
+                beat = (beat - np.mean(beat)) / np.std(beat)
 
-    except Exception as e:
-        print(f"Error processing record {rid}: {e}")
+            beats.append(beat)
+            labels.append(y)
 
-    return np.array(X_rec), np.array(y_rec)
+    return np.array(beats), np.array(labels)
 
-# --- 3. PATIENT-WISE DATA SPLITTING ---
-records = get_record_list(DATA_PATH)
+# =========================
+# LOAD DATA (SAME SAMPLES)
+# =========================
+print("Loading SAME samples for CNN...")
 
-# Split patients: 70% Train, 10% Val, 20% Test
-train_ids, test_ids = train_test_split(records, test_size=0.20, random_state=SEED)
-train_ids, val_ids = train_test_split(train_ids, test_size=0.125, random_state=SEED) # 0.125 * 0.8 = 0.1
+X_train_raw, y_train = load_beats_by_patients(train_patients)
+X_val_raw, y_val     = load_beats_by_patients(val_patients)
+X_test_raw, y_test   = load_beats_by_patients(test_patients)
 
-def collect_data(id_list):
-    X_list, y_list = [], []
-    for rid in id_list:
-        X_r, y_r = extract_beats_from_record(rid)
-        if len(X_r) > 0:
-            X_list.append(X_r)
-            y_list.append(y_r)
-    return np.vstack(X_list), np.hstack(y_list)
+print("Shapes:")
+print("Train:", X_train_raw.shape)
+print("Val:", X_val_raw.shape)
+print("Test:", X_test_raw.shape)
 
-print("Loading data by patient groups...")
-X_train_raw, y_train = collect_data(train_ids)
-X_val_raw, y_val = collect_data(val_ids)
-X_test_raw, y_test = collect_data(test_ids)
+# =========================
+# RESHAPE FOR CNN
+# =========================
+X_train = X_train_raw.reshape(-1, WINDOW_SIZE, 1)
+X_val   = X_val_raw.reshape(-1, WINDOW_SIZE, 1)
+X_test  = X_test_raw.reshape(-1, WINDOW_SIZE, 1)
 
-# Reshape for 1D CNN: (Samples, TimeSteps, Channels)
-X_train = X_train_raw.reshape(X_train_raw.shape[0], X_train_raw.shape[1], 1)
-X_val = X_val_raw.reshape(X_val_raw.shape[0], X_val_raw.shape[1], 1)
-X_test = X_test_raw.reshape(X_test_raw.shape[0], X_test_raw.shape[1], 1)
-
-# Calculate Class Weights to handle imbalance (Normal beats vastly outnumber Arrhythmias)
-weights = class_weight.compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+# =========================
+# CLASS WEIGHTS
+# =========================
+weights = class_weight.compute_class_weight(
+    'balanced',
+    classes=np.unique(y_train),
+    y=y_train
+)
 class_weight_dict = {0: weights[0], 1: weights[1]}
 
-# --- 4. 1D-CNN ARCHITECTURE ---
+# =========================
+# CNN MODEL
+# =========================
 def build_cnn():
     model = models.Sequential([
-        # Layer 1: Captures QRS sharp edges
-        layers.Conv1D(32, kernel_size=11, padding='same', input_shape=(WINDOW_SIZE, 1)),
+        layers.Conv1D(32, 11, padding='same', input_shape=(WINDOW_SIZE, 1)),
         layers.BatchNormalization(),
         layers.ReLU(),
-        layers.MaxPooling1D(pool_size=3),
+        layers.MaxPooling1D(3),
 
-        # Layer 2: Captures rhythm/morphology patterns
-        layers.Conv1D(64, kernel_size=7, padding='same'),
+        layers.Conv1D(64, 7, padding='same'),
         layers.BatchNormalization(),
         layers.ReLU(),
-        layers.MaxPooling1D(pool_size=3),
+        layers.MaxPooling1D(3),
 
-        # Layer 3: Higher level feature integration
-        layers.Conv1D(128, kernel_size=5, padding='same'),
+        layers.Conv1D(128, 5, padding='same'),
         layers.BatchNormalization(),
         layers.ReLU(),
         layers.GlobalAveragePooling1D(),
 
-        # Fully Connected
         layers.Dense(64, activation='relu'),
         layers.Dropout(0.3),
         layers.Dense(1, activation='sigmoid')
@@ -125,54 +131,71 @@ def build_cnn():
     return model
 
 model = build_cnn()
-model.compile(optimizer=optimizers.Adam(learning_rate=0.001),
-              loss='binary_crossentropy',
-              metrics=['accuracy', tf.keras.metrics.Recall(name='recall'), tf.keras.metrics.Precision(name='precision')])
 
-# --- 5. TRAINING ---
-history = model.fit(X_train, y_train,
-                    validation_data=(X_val, y_val),
-                    epochs=20,
-                    batch_size=128,
-                    class_weight=class_weight_dict,
-                    verbose=1)
+model.compile(
+    optimizer=optimizers.Adam(learning_rate=0.001),
+    loss='binary_crossentropy',
+    metrics=['accuracy',
+             tf.keras.metrics.Recall(name='recall'),
+             tf.keras.metrics.Precision(name='precision')]
+)
 
-# --- 6. EVALUATION & VISUALIZATION ---
+model.summary()
+
+# =========================
+# TRAINING
+# =========================
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=50,
+    batch_size=128,
+    class_weight=class_weight_dict,
+    verbose=1
+)
+
+# =========================
+# EVALUATION
+# =========================
 y_pred_prob = model.predict(X_test)
 y_pred = (y_pred_prob > 0.5).astype(int)
 
-# 6a. Training Curves
-plt.figure(figsize=(12, 4))
-plt.subplot(1, 2, 1)
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
+
+# =========================
+# PLOTS
+# =========================
+
+# Loss
+plt.figure()
 plt.plot(history.history['loss'], label='Train')
 plt.plot(history.history['val_loss'], label='Val')
-plt.title('Loss Curve')
+plt.title("Loss Curve")
 plt.legend()
+plt.show()
 
-plt.subplot(1, 2, 2)
+# Accuracy
+plt.figure()
 plt.plot(history.history['accuracy'], label='Train')
 plt.plot(history.history['val_accuracy'], label='Val')
-plt.title('Accuracy Curve')
+plt.title("Accuracy Curve")
 plt.legend()
 plt.show()
 
-# 6b. Confusion Matrix
+# Confusion Matrix
 cm = confusion_matrix(y_test, y_pred)
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Arrhythmia'], yticklabels=['Normal', 'Arrhythmia'])
-plt.xlabel('Predicted')
-plt.ylabel('True')
-plt.title('Confusion Matrix')
+plt.figure()
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=['Normal','Arrhythmia'],
+            yticklabels=['Normal','Arrhythmia'])
+plt.title("Confusion Matrix")
 plt.show()
 
-# 6c. ROC Curve
+# ROC Curve
 fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
 plt.figure()
-plt.plot(fpr, tpr, label=f'AUC = {auc(fpr, tpr):.2f}')
+plt.plot(fpr, tpr, label=f"AUC = {auc(fpr, tpr):.4f}")
 plt.plot([0,1],[0,1],'k--')
-plt.xlabel('FPR')
-plt.ylabel('TPR')
 plt.legend()
+plt.title("ROC Curve")
 plt.show()
-
-print("\nClassification Report:\n", classification_report(y_test, y_pred))
